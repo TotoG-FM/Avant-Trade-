@@ -1,6 +1,7 @@
 import os
 import yaml
 import logging  # 🔄 Doit être avant l'utilisation de `logger`
+import math
 
 # Initialiser le logger dès le début
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -97,7 +98,7 @@ T = 1 / 8760
 N = 100
 DT = T / N
 M = 1000
-INTERVAL = CONFIG.get('interval', 900)  # 15 minutes
+INTERVAL = CONFIG.get('interval', 120)  # rafraîchissement toutes les 120s
 DATA_SAVE_INTERVAL = CONFIG.get('data_save_interval', 900)
 RSI_PERIOD = CONFIG.get('rsi_period', 14)
 RSI_OVERBOUGHT = CONFIG.get('rsi_overbought', 85)
@@ -143,6 +144,23 @@ balance_cache = {'USD': None}
 balance_cache_expiry = {'USD': 0}
 price_cache_expiry = {}
 highest_prices = {pair['symbol']: 0 for pair in CONFIG['pairs']}
+
+# Récupérer le solde USD disponible sur Kraken
+def get_usd_balance():
+    current_time = time.time()
+    if current_time < balance_cache_expiry['USD'] and balance_cache['USD'] is not None:
+        return balance_cache['USD']
+    try:
+        response = client.query_private('Balance')
+        if response.get('error'):
+            raise Exception(response['error'])
+        usd = float(response['result'].get('ZUSD', 0.0))
+        balance_cache['USD'] = usd
+        balance_cache_expiry['USD'] = current_time + 60
+        return usd
+    except Exception as e:
+        logger.error(f"Erreur solde USD : {e}")
+        return 0.0
 if not os.path.exists(CONFIG['cache_dir']):
     os.makedirs(CONFIG['cache_dir'])
     logger.info(f"Répertoire {CONFIG['cache_dir']} créé.")
@@ -972,42 +990,63 @@ def calculate_trailing_stop(current_price, highest_price):
     return highest_price * (1 - TRAILING_PERCENT)
 
 
-# Simuler un ordre d'achat
+# Passer un ordre d'achat limite réel
 def place_buy_order(symbol, quantity, precision, price, positions):
     executed_qty = round(quantity, precision)
-    executed_price = price * (1 + SLIPPAGE_RATE + TRADING_FEE)
+    pair = next(p for p in CONFIG['pairs'] if p['symbol'] == symbol)
+    kraken_symbol = pair['kraken_symbol']
+    try:
+        response = client.query_private('AddOrder', {
+            'pair': kraken_symbol,
+            'type': 'buy',
+            'ordertype': 'limit',
+            'price': f"{price:.5f}",
+            'volume': f"{executed_qty:.{precision}f}"
+        })
+        if response.get('error'):
+            raise Exception(response['error'])
+        logger.info(f"Ordre d'achat envoyé : {symbol} {executed_qty} @ {price}")
+        with open(CONFIG['csv_file'], 'a', newline='') as f:
+            fcntl.flock(f.fileno(), fcntl.LOCK_EX)
+            csv.writer(f).writerow([datetime.now(), symbol, 'buy', executed_qty, price, 0.0])
+            fcntl.flock(f.fileno(), fcntl.LOCK_UN)
+        positions[symbol] += executed_qty
+        return {'executedQty': executed_qty}, positions[symbol]
+    except Exception as e:
+        logger.error(f"Erreur ordre achat {symbol} : {e}")
+        return None, positions[symbol]
 
-    # Écriture du trade
-    with open(CONFIG['csv_file'], 'a', newline='') as f:
-        fcntl.flock(f.fileno(), fcntl.LOCK_EX)
-        csv.writer(f).writerow([datetime.now(), symbol, 'buy', executed_qty, price, 0.0])
-        fcntl.flock(f.fileno(), fcntl.LOCK_UN)
 
-    logger.info(f"Achat simulé : {symbol}, Qté = {executed_qty}, Prix exécuté = {executed_price:.4f}")
-    positions[symbol] += executed_qty
-    return {'executedQty': executed_qty}, positions[symbol]
-
-
-# Simuler un ordre de vente
+# Passer un ordre de vente limite réel
 def place_sell_order(symbol, quantity, precision, price, positions, entry_price):
     executed_qty = round(quantity, precision)
-    executed_price = price * (1 - SLIPPAGE_RATE - TRADING_FEE)
-
-    if entry_price > 0:
-        raw_profit_pct = (executed_price - entry_price) / entry_price
-        net_profit_pct = raw_profit_pct - (2 * SLIPPAGE_RATE + 2 * TRADING_FEE)
-    else:
-        net_profit_pct = 0.0
-
-    # Écriture du trade
-    with open(CONFIG['csv_file'], 'a', newline='') as f:
-        fcntl.flock(f.fileno(), fcntl.LOCK_EX)
-        csv.writer(f).writerow([datetime.now(), symbol, 'sell', executed_qty, price, net_profit_pct])
-        fcntl.flock(f.fileno(), fcntl.LOCK_UN)
-
-    logger.info(f"Vente simulée : {symbol}, Qté = {executed_qty}, Profit net = {net_profit_pct:.4%}")
-    positions[symbol] -= executed_qty
-    return {'executedQty': executed_qty}, positions[symbol]
+    pair = next(p for p in CONFIG['pairs'] if p['symbol'] == symbol)
+    kraken_symbol = pair['kraken_symbol']
+    try:
+        response = client.query_private('AddOrder', {
+            'pair': kraken_symbol,
+            'type': 'sell',
+            'ordertype': 'limit',
+            'price': f"{price:.5f}",
+            'volume': f"{executed_qty:.{precision}f}"
+        })
+        if response.get('error'):
+            raise Exception(response['error'])
+        if entry_price > 0:
+            raw_profit_pct = (price - entry_price) / entry_price
+            net_profit_pct = raw_profit_pct - (2 * SLIPPAGE_RATE + 2 * TRADING_FEE)
+        else:
+            net_profit_pct = 0.0
+        with open(CONFIG['csv_file'], 'a', newline='') as f:
+            fcntl.flock(f.fileno(), fcntl.LOCK_EX)
+            csv.writer(f).writerow([datetime.now(), symbol, 'sell', executed_qty, price, net_profit_pct])
+            fcntl.flock(f.fileno(), fcntl.LOCK_UN)
+        logger.info(f"Ordre de vente envoyé : {symbol} {executed_qty} @ {price}")
+        positions[symbol] -= executed_qty
+        return {'executedQty': executed_qty}, positions[symbol]
+    except Exception as e:
+        logger.error(f"Erreur ordre vente {symbol} : {e}")
+        return None, positions[symbol]
 
 
 # Déterminer si un trade doit être initié
@@ -1026,14 +1065,17 @@ def should_enter_trade(symbol, df, trend, confidence, current_price):
 
 
 # Calcul de la taille de position à acheter
-def compute_position_size(pair, current_price, confidence):
-    if current_price <= 0:
+def compute_position_size(pair, current_price, confidence, usd_balance, total_budget):
+    if current_price <= 0 or usd_balance <= 0 or total_budget <= 0:
         return 0
-    budget = float(pair.get('budget', 0)) * float(confidence)
+    alloc = usd_balance * (float(pair.get('budget', 0)) / total_budget)
+    budget = alloc * float(confidence)
     quantity = budget / current_price
     if quantity * current_price < MIN_NOTIONAL:
         return 0
     precision = pair.get('quantity_precision', 4)
+    step = 10 ** -precision
+    quantity = math.floor(quantity / step) * step
     return round(quantity, precision)
 
 
@@ -1269,13 +1311,17 @@ async def trading_bot():
     last_training_time = time.time()
     initial_budget = float(sum(p['budget'] for p in CONFIG['pairs']))
     trading_history = []
-    portfolio = PortfolioManager(CONFIG['pairs'], initial_budget)
+    portfolio_manager = PortfolioManager(CONFIG['pairs'], initial_budget)
     equity_history = [initial_budget]
     signals = {}
 
     while datetime.fromtimestamp(time.time()) < END_DATE:
         try:
             current_time = time.time()
+
+            positions, average_entry_prices = load_transaction_history(positions, average_entry_prices)
+            usd_balance = get_usd_balance()
+            portfolio_manager.capital = usd_balance
 
             # --- Synchronisations périodiques ---
             if current_time - last_sync_time >= SYNC_POSITION_INTERVAL:
@@ -1307,9 +1353,9 @@ async def trading_bot():
                                      for p2 in CONFIG['pairs']] for p1 in CONFIG['pairs']])
             weights = portfolio_manager.reallocate(np.array(mu_values), np.array(sigma_values), corr_matrix)
 
-            total_budget = float(sum(float(p['budget']) for p in CONFIG['pairs']))
+            total_config_budget = float(sum(float(p['budget']) for p in CONFIG['pairs']))
             adjusted_budgets = {
-                p['symbol']: total_budget * w for p, w in zip(CONFIG['pairs'], weights)
+                p['symbol']: total_config_budget * w for p, w in zip(CONFIG['pairs'], weights)
             }
 
             for pair in CONFIG['pairs']:
@@ -1329,7 +1375,7 @@ async def trading_bot():
 
                 trend, confidence = predict_price_trend(df, symbol)
                 should_trade = should_enter_trade(symbol, df, trend, confidence, current_price)
-                quantity = compute_position_size(pair, current_price, confidence)
+                quantity = compute_position_size(pair, current_price, confidence, usd_balance, total_config_budget)
                 signal_action = "hold"
                 if quantity > 0 and should_trade:
                     order, pos = place_buy_order(symbol, quantity, pair['quantity_precision'], current_price, positions)
@@ -1469,7 +1515,7 @@ if __name__ == "__main__":
           window_size: 500
           trading_fee: 0.0016
           slippage_rate: 0.001
-          interval: 900
+          interval: 120
           data_save_interval: 900
           rsi_period: 14
           rsi_overbought: 85
